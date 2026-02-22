@@ -1,1 +1,7 @@
 context.md
+
+# Build
+build/
+*.o
+*.a
+*.out
