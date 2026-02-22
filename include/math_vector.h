@@ -40,5 +40,13 @@ private:
     std::size_t size_;
 };
 
+// --- Search Result ---
+// Returned by any index search. index is the internal position in VectorStore;
+// the caller translates it to a string ID via VectorStore::get_id().
+struct SearchResult {
+    std::size_t index;
+    float       distance;
+};
+
 // --- Free Functions ---
 float euclidean_distance(const MathVector& a, const MathVector& b);

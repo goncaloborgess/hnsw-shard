@@ -9,4 +9,5 @@ include_directories(include)
 add_executable(${PROJECT_NAME}
     src/main.cpp
     src/mathVector.cpp
+    src/vector_store.cpp
 )
