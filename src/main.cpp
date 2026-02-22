@@ -1,5 +1,6 @@
 #include "math_vector.h"
 #include "vector_store.h"
+#include "brute_force_index.h"
 
 #include <cassert>    // assert()
 #include <cmath>      // std::abs
@@ -238,6 +239,50 @@ static void test_vector_store() {
     std::cout << "  dimension mismatch throws OK\n";
 }
 
+static void test_brute_force_search() {
+    std::cout << "[brute_force_search]\n";
+
+    // Dataset: 5 vectors in 2D space at known positions
+    //
+    //   (1,1) (2,2) (3,3) (4,4) (5,5)
+    //
+    // Query: (2.1, 2.1) — closest to (2,2) at index 1
+    VectorStore store;
+    store.insert("a", MathVector{1.0f, 1.0f});
+    store.insert("b", MathVector{2.0f, 2.0f});
+    store.insert("c", MathVector{3.0f, 3.0f});
+    store.insert("d", MathVector{4.0f, 4.0f});
+    store.insert("e", MathVector{5.0f, 5.0f});
+
+    BruteForceIndex idx(store);
+
+    // Top-1: nearest neighbour to (2.1, 2.1) must be "b" at index 1
+    auto top1 = idx.search(MathVector{2.1f, 2.1f}, 1);
+    assert(top1.size() == 1);
+    assert(top1[0].index == 1);
+    assert(store.get_id(top1[0].index) == "b");
+    std::cout << "  top-1 correct neighbour  OK\n";
+
+    // Top-3: results must be sorted ascending by distance
+    auto top3 = idx.search(MathVector{2.1f, 2.1f}, 3);
+    assert(top3.size() == 3);
+    assert(top3[0].distance <= top3[1].distance);
+    assert(top3[1].distance <= top3[2].distance);
+    std::cout << "  top-3 sorted ascending   OK\n";
+
+    // Query exactly on a stored vector: distance must be 0 for top-1
+    auto exact = idx.search(MathVector{3.0f, 3.0f}, 1);
+    assert(exact.size() == 1);
+    assert(near(exact[0].distance, 0.0f));
+    assert(exact[0].index == 2);
+    std::cout << "  exact match distance=0   OK\n";
+
+    // k > store size: must clamp and return all 5 results
+    auto all = idx.search(MathVector{1.0f, 1.0f}, 100);
+    assert(all.size() == 5);
+    std::cout << "  k > n clamped to n       OK\n";
+}
+
 // =============================================================================
 // Entry point
 // =============================================================================
@@ -256,6 +301,8 @@ int main() {
     test_euclidean_distance();
     std::cout << '\n';
     test_vector_store();
+    std::cout << '\n';
+    test_brute_force_search();
 
     std::cout << "\nAll tests passed.\n";
     return 0;

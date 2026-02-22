@@ -10,4 +10,5 @@ add_executable(${PROJECT_NAME}
     src/main.cpp
     src/mathVector.cpp
     src/vector_store.cpp
+    src/brute_force_index.cpp
 )
