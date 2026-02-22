@@ -1,6 +1,7 @@
 #include "math_vector.h"
 #include "vector_store.h"
 #include "brute_force_index.h"
+#include "hnsw_index.h"
 
 #include <cassert>    // assert()
 #include <chrono>     // high_resolution_clock
@@ -288,6 +289,59 @@ static void test_brute_force_search() {
     std::cout << "  k > n clamped to n       OK\n";
 }
 
+// ---------------------------------------------------------------------------
+// Step 2.1 — HNSW graph construction test
+//
+// Verifies that build() completes without assertion failures, that the node
+// count matches the store, and that the brute-force search() placeholder
+// returns results consistent with BruteForceIndex.
+// ---------------------------------------------------------------------------
+static void test_hnsw_graph_construction() {
+    std::cout << "[hnsw_graph_construction]\n";
+
+    // Five 2D vectors at evenly-spaced diagonal positions.
+    // Closest pair to query (2.1, 2.1) is "b" at index 1.
+    VectorStore store;
+    store.insert("a", MathVector{1.0f, 1.0f});
+    store.insert("b", MathVector{2.0f, 2.0f});
+    store.insert("c", MathVector{3.0f, 3.0f});
+    store.insert("d", MathVector{4.0f, 4.0f});
+    store.insert("e", MathVector{5.0f, 5.0f});
+
+    // M=2: each node keeps at most 2 neighbors.
+    // ef_construction=4: examine up to 4 candidates during build.
+    HnswIndex hnsw(store, /*M=*/2, /*ef_construction=*/4);
+    hnsw.build();
+
+    // Post-build: node count must equal store size.
+    assert(hnsw.size() == store.size());
+    std::cout << "  size() == store.size()   OK\n";
+
+    // search() in Step 2.1 is a brute-force placeholder, so it must agree
+    // exactly with BruteForceIndex for both top-1 identity and sort order.
+    BruteForceIndex bf(store);
+    const MathVector query{2.1f, 2.1f};
+
+    const auto bf_top1   = bf.search(query, 1);
+    const auto hnsw_top1 = hnsw.search(query, 1);
+
+    assert(hnsw_top1.size() == 1);
+    assert(hnsw_top1[0].index == bf_top1[0].index);
+    std::cout << "  top-1 agrees with BF     OK\n";
+
+    // Results must always be sorted ascending by distance.
+    const auto hnsw_top3 = hnsw.search(query, 3);
+    assert(hnsw_top3.size() == 3);
+    assert(hnsw_top3[0].distance <= hnsw_top3[1].distance);
+    assert(hnsw_top3[1].distance <= hnsw_top3[2].distance);
+    std::cout << "  top-3 sorted ascending   OK\n";
+
+    // k > store.size() must be clamped gracefully.
+    const auto hnsw_all = hnsw.search(query, 100);
+    assert(hnsw_all.size() == store.size());
+    std::cout << "  k > n clamped to n       OK\n";
+}
+
 // Generates a single random D-dimensional float vector.
 // Values drawn from uniform [-1.0, 1.0] — a common distribution for
 // synthetic ANN benchmarks. The rng is passed by reference so the caller's
@@ -376,6 +430,8 @@ int main() {
     test_vector_store();
     std::cout << '\n';
     test_brute_force_search();
+    std::cout << '\n';
+    test_hnsw_graph_construction();
 
     std::cout << "\nAll tests passed.\n\n";
 
