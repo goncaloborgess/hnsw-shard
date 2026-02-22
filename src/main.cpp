@@ -3,8 +3,13 @@
 #include "brute_force_index.h"
 
 #include <cassert>    // assert()
+#include <chrono>     // high_resolution_clock
 #include <cmath>      // std::abs
+#include <iomanip>    // std::setprecision
 #include <iostream>
+#include <limits>     // std::numeric_limits
+#include <numeric>    // std::accumulate
+#include <random>     // std::mt19937, std::uniform_real_distribution
 #include <stdexcept>  // std::invalid_argument
 
 // Float comparison: exact equality is unreliable for floating-point results.
@@ -283,6 +288,74 @@ static void test_brute_force_search() {
     std::cout << "  k > n clamped to n       OK\n";
 }
 
+// Generates a single random D-dimensional float vector.
+// Values drawn from uniform [-1.0, 1.0] — a common distribution for
+// synthetic ANN benchmarks. The rng is passed by reference so the caller's
+// state advances and every call produces a different vector.
+static MathVector generate_random_vector(std::size_t dim, std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    MathVector v(dim);
+    for (std::size_t i = 0; i < dim; ++i)
+        v[i] = dist(rng);
+    return v;
+}
+
+static void run_benchmark() {
+    constexpr std::size_t N = 50'000;  // vectors in the store
+    constexpr std::size_t D = 128;     // dimensions per vector
+    constexpr std::size_t K = 10;      // neighbours to retrieve
+    constexpr std::size_t Q = 100;     // number of timed queries
+
+    std::cout << "=== Benchmark: Brute-Force k-NN ===\n";
+    std::cout << "  dataset : " << N << " vectors x " << D << " dimensions\n";
+    std::cout << "  k       : " << K << "\n";
+    std::cout << "  queries : " << Q << "\n\n";
+
+    std::mt19937 rng(42);  // fixed seed — results are reproducible across runs
+
+    // --- Build the store ---
+    // Insertion is not timed: we are benchmarking search latency only.
+    std::cout << "  building store... " << std::flush;
+    VectorStore store;
+    for (std::size_t i = 0; i < N; ++i)
+        store.insert("vec-" + std::to_string(i), generate_random_vector(D, rng));
+    std::cout << "done\n\n";
+
+    BruteForceIndex idx(store);
+
+    // Pre-generate all query vectors before the timing loop so that
+    // random number generation does not pollute the latency measurements.
+    std::vector<MathVector> queries;
+    queries.reserve(Q);
+    for (std::size_t i = 0; i < Q; ++i)
+        queries.push_back(generate_random_vector(D, rng));
+
+    // --- Timed loop ---
+    using clock = std::chrono::high_resolution_clock;
+    using ms    = std::chrono::duration<double, std::milli>;
+
+    std::vector<double> latencies;
+    latencies.reserve(Q);
+
+    for (const auto& query : queries) {
+        const auto t0 = clock::now();
+        auto results  = idx.search(query, K);
+        const auto t1 = clock::now();
+        latencies.push_back(ms(t1 - t0).count());
+        (void)results;  // result used — prevents the compiler optimising the call away
+    }
+
+    // --- Report ---
+    const double avg = std::accumulate(latencies.begin(), latencies.end(), 0.0) / Q;
+    const double min = *std::min_element(latencies.begin(), latencies.end());
+    const double max = *std::max_element(latencies.begin(), latencies.end());
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "  avg latency : " << avg << " ms\n";
+    std::cout << "  min latency : " << min << " ms\n";
+    std::cout << "  max latency : " << max << " ms\n";
+}
+
 // =============================================================================
 // Entry point
 // =============================================================================
@@ -304,6 +377,9 @@ int main() {
     std::cout << '\n';
     test_brute_force_search();
 
-    std::cout << "\nAll tests passed.\n";
+    std::cout << "\nAll tests passed.\n\n";
+
+    run_benchmark();
+
     return 0;
 }
