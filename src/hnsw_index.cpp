@@ -3,16 +3,25 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 // ---------------------------------------------------------------------------
 // Constructor
 //
-// mL is derived as 1/ln(M). This is not arbitrary: it calibrates the
-// geometric distribution used for layer assignment so that the expected
-// number of nodes at layer L decreases by a factor of M for each step up.
-// The result is the same sparsity ratio as a classical Skip List, which is
-// the theoretical basis for HNSW's O(log N) complexity guarantee.
+// mL = 1/ln(M) is the layer assignment scale factor. It is not arbitrary.
+//
+// The HNSW paper proves that setting mL = 1/ln(M) produces a geometric
+// distribution where the probability that a node reaches layer L is (1/M)^L.
+// This makes the expected number of nodes at each layer decrease by a factor
+// of M per step upward — identical to the sparsity of a Skip List with
+// promotion probability 1/M. That sparsity is what gives both structures
+// their O(log N) search complexity.
+//
+// M_max0 = 2*M is the neighbor cap for layer 0. Layer 0 carries the full
+// dataset and is the densest layer. Allowing 2*M connections there
+// (vs M everywhere else) improves recall without a meaningful memory cost
+// because layer 0 is the only layer all N nodes inhabit.
 // ---------------------------------------------------------------------------
 HnswIndex::HnswIndex(const VectorStore& store,
                      std::size_t        M,
@@ -23,49 +32,56 @@ HnswIndex::HnswIndex(const VectorStore& store,
     , mL_(1.0 / std::log(static_cast<double>(M)))
     , entry_point_(0)
     , max_layer_(0)
-    , rng_(42) // fixed seed: reproducible builds and benchmarks
+    , rng_(42)
 {}
 
-// ---------------------------------------------------------------------------
-// build()
-//
-// Iterates the store in insertion order and calls insert_node() for each
-// vector. The sequential order is deliberate: the first node bootstraps the
-// entry point, and every subsequent insert can already use the graph to
-// locate its neighbors.
-// ---------------------------------------------------------------------------
 void HnswIndex::build() {
     if (store_.empty()) return;
-
     nodes_.reserve(store_.size());
-
     for (std::size_t i = 0; i < store_.size(); ++i) {
         insert_node(i);
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inspection accessors
+// ---------------------------------------------------------------------------
+
 std::size_t HnswIndex::size() const noexcept {
     return nodes_.size();
 }
 
+int HnswIndex::max_layer() const noexcept {
+    return max_layer_;
+}
+
+std::size_t HnswIndex::entry_point() const noexcept {
+    return entry_point_;
+}
+
+// A node "exists at layer L" if its neighbors jagged vector has at least
+// L+1 inner vectors, i.e., neighbors.size() > static_cast<size_t>(layer).
+std::size_t HnswIndex::layer_population(int layer) const noexcept {
+    if (layer < 0) return 0;
+    std::size_t count = 0;
+    for (const HnswNode& node : nodes_) {
+        if (static_cast<int>(node.neighbors.size()) > layer) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 // ---------------------------------------------------------------------------
-// Task 2.1b — select_neighbors (simple heuristic)
+// select_neighbors
 //
-// Selects the best M candidates from the pool purely by distance.
-// The candidates vector is not assumed to be sorted on entry.
-//
-// Why isolate this?
-// The HNSW paper defines a second heuristic ("select neighbors heuristic")
-// that prefers candidates which extend reach in new directions, avoiding
-// the tight clustering that the simple version can produce. By keeping this
-// function separate we can swap the strategy in one place, and both insert()
-// and potential future re-wiring code pick up the change automatically.
+// Simple heuristic: return the M closest candidates by distance.
+// Sorting a local copy preserves the caller's candidate pool ordering.
 // ---------------------------------------------------------------------------
 std::vector<std::size_t> HnswIndex::select_neighbors(
     const std::vector<SearchResult>& candidates,
     std::size_t                      M) const
 {
-    // Work on a local sorted copy — do not mutate the caller's pool.
     std::vector<SearchResult> sorted = candidates;
     std::sort(sorted.begin(), sorted.end(),
               [](const SearchResult& a, const SearchResult& b) {
@@ -82,111 +98,148 @@ std::vector<std::size_t> HnswIndex::select_neighbors(
 }
 
 // ---------------------------------------------------------------------------
-// Task 2.1c — insert_node()
+// Step 2.2 — draw_layer()
 //
-// Inserts a single vector (identified by its VectorStore index) into the
-// graph at layer 0.
+// Samples the maximum layer for a new node using the formula:
 //
-// Step 2.1 keeps every node at layer 0 only. Step 2.2 adds the layer draw
-// and multi-layer wiring. The structure here is intentionally written to
-// make that extension obvious: the layer loop (currently trivial) is where
-// Step 2.2's logic slots in.
+//     l = floor( -ln(uniform(0,1)) * mL )
 //
-// Key invariant maintained throughout: BIDIRECTIONAL EDGES.
-// If node A lists node B as a neighbor, B must also list A.
-// Violation creates directed dead-zones where search can enter a region
-// but cannot navigate within it, causing silent recall collapse.
+// This is the inverse-CDF transform of the geometric distribution.
+// -ln(U) where U ~ Uniform(0,1) gives an Exponential(1) random variable.
+// Multiplying by mL scales it so that the floor hits 0 with probability
+// 1 - 1/M, hits 1 with probability 1/M - 1/M^2, and so on.
+//
+// The clamp to std::numeric_limits<double>::min() prevents ln(0) = -inf
+// in the astronomically unlikely event that the RNG returns exactly 0.
+// ---------------------------------------------------------------------------
+int HnswIndex::draw_layer() {
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    double r = uniform(rng_);
+    if (r < std::numeric_limits<double>::min()) {
+        r = std::numeric_limits<double>::min();
+    }
+    return static_cast<int>(-std::log(r) * mL_);
+}
+
+// ---------------------------------------------------------------------------
+// Step 2.2 — insert_node()
+//
+// Inserts one vector into the graph at every layer from 0 to node_max_layer.
+//
+// Construction algorithm (per the HNSW paper, Algorithm 1):
+//
+//   1. Draw node_max_layer from the geometric distribution.
+//   2. Allocate the node's jagged neighbor lists (one per layer up to its max).
+//   3. For each layer from node_max_layer down to 0:
+//        a. Collect candidates: existing nodes that inhabit this layer.
+//        b. Cap the pool at ef_construction_, sort by distance.
+//        c. Prune to M (or M_max0=2M for layer 0) via select_neighbors.
+//        d. Write forward edges (new node → chosen).
+//        e. Write reverse edges (chosen → new node), re-pruning any
+//           neighbor whose degree now exceeds its layer cap.
+//   4. If node_max_layer > max_layer_, promote it to the entry point.
+//
+// The descent from node_max_layer down to 0 (not 0 up to node_max_layer)
+// is deliberate: upper layers have fewer nodes, so their candidate scans
+// are cheap. By the time we reach layer 0 we have already established
+// coarse connections in the sparse upper layers.
+//
+// Step 2.3 will replace the O(N) candidate scan with search_layer(),
+// giving O(log N) candidate discovery per layer.
 // ---------------------------------------------------------------------------
 void HnswIndex::insert_node(std::size_t node_idx) {
-    // --- Allocate the node ---
-    // Layer 0 only for now. neighbors is resized to 1 layer.
+    const int node_max_layer = draw_layer();
+
+    // Allocate the node with one neighbor list per layer it inhabits.
+    // The jagged shape encodes the node's reach: neighbors.size()-1 == its max layer.
     HnswNode node;
     node.index = node_idx;
-    node.neighbors.resize(1); // layer 0
+    node.neighbors.resize(static_cast<std::size_t>(node_max_layer) + 1);
     nodes_.push_back(std::move(node));
 
-    // --- Bootstrap: first node becomes the entry point ---
-    // There is nothing to connect to, so we return immediately.
-    // The entry point is updated in Step 2.2 when nodes can reach higher layers.
+    // Bootstrap: first node — nothing to connect, just set the entry point.
     if (nodes_.size() == 1) {
         entry_point_ = node_idx;
-        max_layer_   = 0;
+        max_layer_   = node_max_layer;
         return;
     }
 
-    // --- Find candidate neighbors via brute-force scan over existing nodes ---
-    //
-    // We scan every node already in nodes_ (all except the one just pushed)
-    // and compute distances to the new vector.
-    //
-    // This O(N) scan is the temporary stand-in for search_layer(), which will
-    // replace it in Step 2.3. At that point, insert_node() calls search_layer()
-    // with ef = ef_construction_ to obtain the candidate pool in O(log N) time.
-    //
-    // Using ef_construction_ candidates (not just M) before pruning is
-    // intentional: a larger initial pool gives select_neighbors() more material
-    // to choose from, which produces higher-quality connections.
     const MathVector& query = store_.get(node_idx);
 
-    std::vector<SearchResult> candidates;
-    candidates.reserve(nodes_.size() - 1);
+    // Process every layer this node inhabits, top-down.
+    for (int layer = node_max_layer; layer >= 0; --layer) {
 
-    for (std::size_t i = 0; i < nodes_.size() - 1; ++i) {
-        const std::size_t idx  = nodes_[i].index;
-        const float       dist = euclidean_distance(query, store_.get(idx));
-        candidates.push_back({idx, dist});
-    }
+        // M_max for this layer.
+        // Layer 0 gets 2*M connections — a denser base improves recall
+        // without affecting upper-layer traversal speed.
+        const std::size_t M_max = (layer == 0) ? 2 * M_ : M_;
 
-    // Cap the pool at ef_construction_ to bound the work done by select_neighbors.
-    std::sort(candidates.begin(), candidates.end(),
-              [](const SearchResult& a, const SearchResult& b) {
-                  return a.distance < b.distance;
-              });
-    if (candidates.size() > ef_construction_) {
-        candidates.resize(ef_construction_);
-    }
-
-    // --- Prune candidates to M neighbors ---
-    const std::vector<std::size_t> chosen = select_neighbors(candidates, M_);
-
-    // --- Write FORWARD edges: new node → chosen neighbors ---
-    nodes_.back().neighbors[0] = chosen;
-
-    // --- Write REVERSE edges: each chosen neighbor → new node ---
-    //
-    // Invariant: nodes_[i].index == i because build() inserts sequentially.
-    // This lets us subscript nodes_ directly with a VectorStore index.
-    //
-    // Adding the reverse edge may push a neighbor's degree over M_.
-    // When that happens, re-run select_neighbors over the neighbor's full
-    // (now enlarged) neighbor list to prune it back to M_.
-    // The evicted edge is simply dropped — the graph remains valid because
-    // the remaining edges were a better set of M connections.
-    for (const std::size_t neighbor_idx : chosen) {
-        std::vector<std::size_t>& rev = nodes_[neighbor_idx].neighbors[0];
-        rev.push_back(node_idx);
-
-        if (rev.size() > M_) {
-            // Recompute distances from the neighbor to all its current links.
-            const MathVector& neighbor_vec = store_.get(neighbor_idx);
-            std::vector<SearchResult> re_candidates;
-            re_candidates.reserve(rev.size());
-            for (const std::size_t nb : rev) {
-                const float d = euclidean_distance(neighbor_vec, store_.get(nb));
-                re_candidates.push_back({nb, d});
+        // --- Collect candidates: all existing nodes at this layer ---
+        // A node exists at layer L iff neighbors.size() > L.
+        // We exclude the node just pushed (nodes_.back()) by iterating
+        // only nodes_.size() - 1 entries.
+        std::vector<SearchResult> candidates;
+        for (std::size_t i = 0; i < nodes_.size() - 1; ++i) {
+            if (static_cast<int>(nodes_[i].neighbors.size()) > layer) {
+                const float dist = euclidean_distance(query, store_.get(nodes_[i].index));
+                candidates.push_back({nodes_[i].index, dist});
             }
-            rev = select_neighbors(re_candidates, M_);
         }
+
+        // If no nodes exist at this layer yet, skip — happens for the first
+        // node that reaches a new upper layer. The entry-point update below
+        // will anchor this node as the layer's seed.
+        if (candidates.empty()) continue;
+
+        // Cap the pool at ef_construction_ and sort ascending by distance.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const SearchResult& a, const SearchResult& b) {
+                      return a.distance < b.distance;
+                  });
+        if (candidates.size() > ef_construction_) {
+            candidates.resize(ef_construction_);
+        }
+
+        // --- Prune to M_max neighbors ---
+        const std::vector<std::size_t> chosen = select_neighbors(candidates, M_max);
+
+        // --- Forward edges: new node → chosen ---
+        nodes_.back().neighbors[static_cast<std::size_t>(layer)] = chosen;
+
+        // --- Reverse edges: chosen → new node (bidirectional invariant) ---
+        for (const std::size_t neighbor_idx : chosen) {
+            std::vector<std::size_t>& rev =
+                nodes_[neighbor_idx].neighbors[static_cast<std::size_t>(layer)];
+            rev.push_back(node_idx);
+
+            // Re-prune if the reverse edge pushes the neighbor over its cap.
+            if (rev.size() > M_max) {
+                const MathVector& neighbor_vec = store_.get(neighbor_idx);
+                std::vector<SearchResult> re_candidates;
+                re_candidates.reserve(rev.size());
+                for (const std::size_t nb : rev) {
+                    const float d = euclidean_distance(neighbor_vec, store_.get(nb));
+                    re_candidates.push_back({nb, d});
+                }
+                rev = select_neighbors(re_candidates, M_max);
+            }
+        }
+    }
+
+    // --- Promote entry point if this node reaches a higher layer ---
+    //
+    // The entry point must always be the node with the highest max-layer.
+    // Searches start there and descend; starting below the true maximum
+    // would skip part of the hierarchy and degrade recall.
+    if (node_max_layer > max_layer_) {
+        entry_point_ = node_idx;
+        max_layer_   = node_max_layer;
     }
 }
 
 // ---------------------------------------------------------------------------
-// search() — Step 2.1 placeholder
-//
-// Brute-force scan over all nodes. Functionally correct; used exclusively
-// during Step 2.1 to verify that the graph was built without assertion
-// failures and that SearchResult output matches BruteForceIndex.
-// Replaced entirely by knn_search() in Step 2.3.
+// search() — Step 2.1/2.2 placeholder (brute-force)
+// Replaced by knn_search() in Step 2.3.
 // ---------------------------------------------------------------------------
 std::vector<SearchResult> HnswIndex::search(const MathVector& query,
                                              std::size_t        k) const
