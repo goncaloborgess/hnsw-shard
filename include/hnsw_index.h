@@ -36,54 +36,58 @@ struct HnswNode {
 //                     Layer 0 uses 2*M (M_max0) for a denser base layer.
 //   ef_construction — candidate pool size during graph build (default: 200).
 //                     Larger = higher graph quality, slower build.
+//                     This cost is paid once at index build time.
+//   ef_search       — beam width during query (default: 50).
+//                     Larger = higher recall, slower queries.
+//                     This is the primary knob for the accuracy/speed tradeoff
+//                     at runtime — it can be tuned without rebuilding the index.
 //   mL              — layer scale factor, derived as 1/ln(M).
-//                     Not a free parameter: its optimal value is a function
-//                     of M and the Skip List probability derivation.
+//                     Not a free parameter; computed from M.
 // ---------------------------------------------------------------------------
 class HnswIndex {
 public:
     explicit HnswIndex(const VectorStore& store,
                        std::size_t        M               = 16,
-                       std::size_t        ef_construction = 200);
+                       std::size_t        ef_construction = 200,
+                       std::size_t        ef_search       = 50);
 
     // Build the graph over all vectors currently in the store.
     // Must be called once after the store is fully populated.
     void build();
 
     // k nearest neighbours of query, sorted ascending by distance.
+    // Uses multi-layer greedy traversal (Step 2.3).
     // Precondition: query.size() == store_.dimensionality()
-    // NOTE: Step 2.1/2.2 placeholder — brute-force scan.
-    //       Replaced by the real greedy traversal in Step 2.3.
     std::vector<SearchResult> search(const MathVector& query, std::size_t k) const;
 
     // --- Inspection accessors (used by tests and Step 2.4 benchmarking) ---
 
-    // Total number of nodes in the graph.
-    std::size_t size() const noexcept;
-
-    // Highest layer index currently in the graph (0-based).
-    int max_layer() const noexcept;
-
-    // VectorStore index of the current graph entry point.
-    // The entry point always lives at max_layer().
+    std::size_t size()       const noexcept;
+    int         max_layer()  const noexcept;
     std::size_t entry_point() const noexcept;
-
-    // Number of nodes that exist at the given layer.
-    // A node exists at layer L if its neighbors vector has size > L.
     std::size_t layer_population(int layer) const noexcept;
 
 private:
+    // Step 2.3a — Single-layer greedy beam search.
+    //
+    // Starting from ep_idx, explores the graph at 'layer' maintaining:
+    //   - a min-heap of candidates (closest unexplored node at top)
+    //   - a max-heap of results   (furthest accepted result at top)
+    //
+    // Terminates when every remaining candidate is farther than the
+    // worst accepted result — no further improvement is possible.
+    // Returns up to ef results in unspecified order; caller sorts.
+    std::vector<SearchResult> search_layer(const MathVector& query,
+                                           std::size_t       ep_idx,
+                                           std::size_t       ef,
+                                           int               layer) const;
+
     // Neighbor selection (simple distance heuristic).
-    // Returns up to M indices from the candidate pool, closest first.
-    // Isolated so the selection strategy can be upgraded independently.
     std::vector<std::size_t> select_neighbors(
         const std::vector<SearchResult>& candidates,
         std::size_t                      M) const;
 
-    // Step 2.2 — Draw the maximum layer for a new node.
-    // Formula: floor(-ln(uniform(0,1)) * mL)
-    // Produces the geometric distribution that gives HNSW its
-    // Skip List-equivalent sparsity and O(log N) complexity.
+    // Draw the maximum layer for a new node: floor(-ln(U) * mL)
     int draw_layer();
 
     // Insert one vector (by VectorStore index) into all its layers.
@@ -92,14 +96,15 @@ private:
     const VectorStore& store_;
     std::size_t        M_;
     std::size_t        ef_construction_;
+    std::size_t        ef_search_;      // beam width at query time
     double             mL_;            // 1 / ln(M)
 
     // One HnswNode per vector, in insertion order.
     // Invariant: nodes_[i].index == i (build() inserts sequentially).
     std::vector<HnswNode> nodes_;
 
-    std::size_t entry_point_; // VectorStore index of the entry point node
-    int         max_layer_;   // highest layer in the graph
+    std::size_t entry_point_;
+    int         max_layer_;
 
-    std::mt19937 rng_;        // RNG for draw_layer() — seeded for reproducibility
+    std::mt19937 rng_;
 };

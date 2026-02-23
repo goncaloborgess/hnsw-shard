@@ -12,6 +12,7 @@
 #include <numeric>    // std::accumulate
 #include <random>     // std::mt19937, std::uniform_real_distribution
 #include <stdexcept>  // std::invalid_argument
+#include <unordered_set>
 
 // Float comparison: exact equality is unreliable for floating-point results.
 // We test that the result is within a small epsilon of the expected value.
@@ -439,59 +440,221 @@ static MathVector generate_random_vector(std::size_t dim, std::mt19937& rng) {
 }
 
 static void run_benchmark() {
-    constexpr std::size_t N = 50'000;  // vectors in the store
-    constexpr std::size_t D = 128;     // dimensions per vector
-    constexpr std::size_t K = 10;      // neighbours to retrieve
-    constexpr std::size_t Q = 100;     // number of timed queries
+    constexpr std::size_t N       = 50'000; // vectors in the dataset
+    constexpr std::size_t D       = 128;    // dimensions per vector
+    constexpr std::size_t K       = 10;     // neighbours to retrieve
+    constexpr std::size_t Q       = 100;    // timed queries
+    constexpr std::size_t M       = 16;     // HNSW max neighbours per layer
+    constexpr std::size_t EF_CON  = 200;    // HNSW build beam width
+    constexpr std::size_t EF_SRCH = 50;     // HNSW query beam width
 
-    std::cout << "=== Benchmark: Brute-Force k-NN ===\n";
-    std::cout << "  dataset : " << N << " vectors x " << D << " dimensions\n";
-    std::cout << "  k       : " << K << "\n";
-    std::cout << "  queries : " << Q << "\n\n";
+    using clock = std::chrono::high_resolution_clock;
+    using ms    = std::chrono::duration<double, std::milli>;
+    using sec   = std::chrono::duration<double>;
 
-    std::mt19937 rng(42);  // fixed seed — results are reproducible across runs
+    std::cout << "=== Benchmark: Brute-Force vs HNSW ===\n";
+    std::cout << "  dataset  : " << N << " vectors x " << D << " dimensions\n";
+    std::cout << "  k        : " << K << "\n";
+    std::cout << "  queries  : " << Q << "\n";
+    std::cout << "  M        : " << M << "  |  ef_construction: " << EF_CON
+              << "  |  ef_search: " << EF_SRCH << "\n\n";
 
-    // --- Build the store ---
-    // Insertion is not timed: we are benchmarking search latency only.
-    std::cout << "  building store... " << std::flush;
+    std::mt19937 rng(42);
+
+    // -----------------------------------------------------------------------
+    // Build the shared VectorStore
+    // -----------------------------------------------------------------------
+    std::cout << "  [1/4] building store (" << N << " x " << D << ")... " << std::flush;
     VectorStore store;
     for (std::size_t i = 0; i < N; ++i)
         store.insert("vec-" + std::to_string(i), generate_random_vector(D, rng));
-    std::cout << "done\n\n";
+    std::cout << "done\n";
 
-    BruteForceIndex idx(store);
+    // -----------------------------------------------------------------------
+    // Build HNSW index (timed)
+    // The graph build uses search_layer for O(ef*M*log N) insertion cost.
+    // -----------------------------------------------------------------------
+    std::cout << "  [2/4] building HNSW index... " << std::flush;
+    HnswIndex hnsw(store, M, EF_CON, EF_SRCH);
+    const auto build_t0 = clock::now();
+    hnsw.build();
+    const auto build_t1 = clock::now();
+    const double build_s = sec(build_t1 - build_t0).count();
+    std::cout << "done  (" << std::fixed << std::setprecision(2)
+              << build_s << " s,  max_layer=" << hnsw.max_layer() << ")\n";
 
-    // Pre-generate all query vectors before the timing loop so that
-    // random number generation does not pollute the latency measurements.
+    // -----------------------------------------------------------------------
+    // Pre-generate query vectors outside any timed section
+    // -----------------------------------------------------------------------
+    std::cout << "  [3/4] generating " << Q << " query vectors... " << std::flush;
     std::vector<MathVector> queries;
     queries.reserve(Q);
     for (std::size_t i = 0; i < Q; ++i)
         queries.push_back(generate_random_vector(D, rng));
+    std::cout << "done\n\n";
 
-    // --- Timed loop ---
-    using clock = std::chrono::high_resolution_clock;
-    using ms    = std::chrono::duration<double, std::milli>;
+    // -----------------------------------------------------------------------
+    // Time brute-force search and store results for recall computation
+    // -----------------------------------------------------------------------
+    std::cout << "  [4/4] running timed queries...\n\n";
 
-    std::vector<double> latencies;
-    latencies.reserve(Q);
+    BruteForceIndex bf(store);
+    std::vector<std::vector<SearchResult>> bf_results(Q);
+    std::vector<double> bf_lat;
+    bf_lat.reserve(Q);
 
-    for (const auto& query : queries) {
+    for (std::size_t i = 0; i < Q; ++i) {
         const auto t0 = clock::now();
-        auto results  = idx.search(query, K);
+        bf_results[i]  = bf.search(queries[i], K);
         const auto t1 = clock::now();
-        latencies.push_back(ms(t1 - t0).count());
-        (void)results;  // result used — prevents the compiler optimising the call away
+        bf_lat.push_back(ms(t1 - t0).count());
     }
 
-    // --- Report ---
-    const double avg = std::accumulate(latencies.begin(), latencies.end(), 0.0) / Q;
-    const double min = *std::min_element(latencies.begin(), latencies.end());
-    const double max = *std::max_element(latencies.begin(), latencies.end());
+    // -----------------------------------------------------------------------
+    // Time HNSW search and compute recall@K against brute-force ground truth
+    // -----------------------------------------------------------------------
+    std::vector<double> hnsw_lat;
+    hnsw_lat.reserve(Q);
+    double total_recall = 0.0;
+
+    for (std::size_t i = 0; i < Q; ++i) {
+        const auto t0      = clock::now();
+        const auto hnsw_r  = hnsw.search(queries[i], K);
+        const auto t1      = clock::now();
+        hnsw_lat.push_back(ms(t1 - t0).count());
+
+        // recall@K = |HNSW_topK ∩ BF_topK| / K
+        std::unordered_set<std::size_t> gt;
+        for (const auto& r : bf_results[i]) gt.insert(r.index);
+        std::size_t hits = 0;
+        for (const auto& r : hnsw_r) { if (gt.count(r.index)) ++hits; }
+        total_recall += static_cast<double>(hits) / static_cast<double>(K);
+        (void)hnsw_r;
+    }
+
+    // -----------------------------------------------------------------------
+    // Report
+    // -----------------------------------------------------------------------
+    const double bf_avg   = std::accumulate(bf_lat.begin(),   bf_lat.end(),   0.0) / Q;
+    const double bf_min   = *std::min_element(bf_lat.begin(), bf_lat.end());
+    const double bf_max   = *std::max_element(bf_lat.begin(), bf_lat.end());
+
+    const double hnsw_avg = std::accumulate(hnsw_lat.begin(), hnsw_lat.end(), 0.0) / Q;
+    const double hnsw_min = *std::min_element(hnsw_lat.begin(), hnsw_lat.end());
+    const double hnsw_max = *std::max_element(hnsw_lat.begin(), hnsw_lat.end());
+
+    const double speedup  = bf_avg / hnsw_avg;
+    const double recall   = total_recall / static_cast<double>(Q);
 
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "  avg latency : " << avg << " ms\n";
-    std::cout << "  min latency : " << min << " ms\n";
-    std::cout << "  max latency : " << max << " ms\n";
+
+    // Latency table
+    std::cout << "  +-----------------+-----------+-----------+-----------+\n";
+    std::cout << "  |                 |  avg (ms) |  min (ms) |  max (ms) |\n";
+    std::cout << "  +-----------------+-----------+-----------+-----------+\n";
+    std::cout << "  | brute-force     | " << std::setw(9) << bf_avg
+              << " | " << std::setw(9) << bf_min
+              << " | " << std::setw(9) << bf_max << " |\n";
+    std::cout << "  | HNSW            | " << std::setw(9) << hnsw_avg
+              << " | " << std::setw(9) << hnsw_min
+              << " | " << std::setw(9) << hnsw_max << " |\n";
+    std::cout << "  +-----------------+-----------+-----------+-----------+\n\n";
+
+    std::cout << "  speedup  (BF avg / HNSW avg) : " << std::setprecision(1)
+              << speedup << "x\n";
+    std::cout << "  recall@" << K << "                   : " << std::setprecision(3)
+              << recall << "\n";
+    std::cout << "  HNSW build time              : " << std::setprecision(2)
+              << build_s << " s\n";
+}
+
+// ---------------------------------------------------------------------------
+// Step 2.3 — HNSW search quality test
+//
+// Verifies that the real greedy traversal returns meaningful approximate
+// nearest neighbours by measuring recall@10: the fraction of HNSW top-10
+// results that also appear in the brute-force top-10.
+//
+// recall@10 = |HNSW_top10 ∩ BF_top10| / 10
+//
+// A recall of 1.0 means the HNSW result is identical to exact search.
+// With M=16, ef_construction=100, ef_search=50 on a 500-vector dataset
+// in 16 dimensions, we expect recall well above 0.85.
+// ---------------------------------------------------------------------------
+static void test_hnsw_search() {
+    std::cout << "[hnsw_search]\n";
+
+    constexpr std::size_t N       = 500;
+    constexpr std::size_t D       = 16;
+    constexpr std::size_t K       = 10;
+    constexpr std::size_t Q       = 20;   // queries to evaluate
+    constexpr std::size_t M       = 16;
+    constexpr std::size_t EF_CON  = 100;
+    constexpr std::size_t EF_SRCH = 50;
+
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    // Build the store.
+    VectorStore store;
+    for (std::size_t i = 0; i < N; ++i) {
+        MathVector v(D);
+        for (std::size_t d = 0; d < D; ++d) v[d] = dist(rng);
+        store.insert("v" + std::to_string(i), std::move(v));
+    }
+
+    // Build both indexes over the same store.
+    BruteForceIndex bf(store);
+    HnswIndex hnsw(store, M, EF_CON, EF_SRCH);
+    hnsw.build();
+
+    // Pre-generate query vectors (outside the timed loop).
+    std::vector<MathVector> queries;
+    queries.reserve(Q);
+    for (std::size_t q = 0; q < Q; ++q) {
+        MathVector qv(D);
+        for (std::size_t d = 0; d < D; ++d) qv[d] = dist(rng);
+        queries.push_back(std::move(qv));
+    }
+
+    // Measure recall@K for each query.
+    // recall@K = |HNSW_topK ∩ BF_topK| / K
+    double total_recall = 0.0;
+    for (const auto& query : queries) {
+        const auto bf_results   = bf.search(query, K);
+        const auto hnsw_results = hnsw.search(query, K);
+
+        // Build a set of the brute-force ground-truth indices.
+        std::unordered_set<std::size_t> gt_set;
+        for (const auto& r : bf_results) gt_set.insert(r.index);
+
+        // Count how many HNSW results are in the ground-truth set.
+        std::size_t hits = 0;
+        for (const auto& r : hnsw_results) {
+            if (gt_set.count(r.index)) ++hits;
+        }
+        total_recall += static_cast<double>(hits) / static_cast<double>(K);
+    }
+
+    const double avg_recall = total_recall / static_cast<double>(Q);
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "  recall@" << K << " (avg over " << Q << " queries) : "
+              << avg_recall << "\n";
+
+    // Results must be sorted ascending by distance.
+    const auto sample = hnsw.search(queries[0], K);
+    assert(sample.size() == K);
+    for (std::size_t i = 1; i < sample.size(); ++i) {
+        assert(sample[i - 1].distance <= sample[i].distance);
+    }
+    std::cout << "  results sorted ascending  OK\n";
+
+    // Recall must exceed the threshold. A well-built HNSW index on
+    // 500 vectors in 16D with these parameters should reach > 0.85
+    // even with approximate construction (brute-force candidate scan).
+    assert(avg_recall >= 0.85);
+    std::cout << "  recall >= 0.85            OK\n";
 }
 
 // =============================================================================
@@ -518,6 +681,8 @@ int main() {
     test_hnsw_graph_construction();
     std::cout << '\n';
     test_hnsw_hierarchy();
+    std::cout << '\n';
+    test_hnsw_search();
 
     std::cout << "\nAll tests passed.\n\n";
 
