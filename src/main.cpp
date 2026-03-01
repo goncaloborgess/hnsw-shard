@@ -6,6 +6,7 @@
 #include <cassert>    // assert()
 #include <chrono>     // high_resolution_clock
 #include <cmath>      // std::abs
+#include <fstream>    // std::ifstream (fvecs loader)
 #include <iomanip>    // std::setprecision
 #include <iostream>
 #include <limits>     // std::numeric_limits
@@ -439,9 +440,67 @@ static MathVector generate_random_vector(std::size_t dim, std::mt19937& rng) {
     return v;
 }
 
+// ---------------------------------------------------------------------------
+// fvecs loader helpers
+//
+// fvecs binary format (one record per vector):
+//   [int32_t dim][float32 × dim]
+//
+// load_fvecs_store  — reads up to max_vectors records into a VectorStore.
+// load_fvecs_queries — reads up to max_vectors records into a plain vector.
+//
+// Both return the number of vectors actually loaded.
+// An empty return means the file could not be opened.
+// ---------------------------------------------------------------------------
+static std::size_t load_fvecs_store(const std::string& path,
+                                    VectorStore&       store,
+                                    std::size_t        max_vectors)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return 0;
+
+    std::size_t count = 0;
+    while (count < max_vectors) {
+        int32_t dim = 0;
+        if (!f.read(reinterpret_cast<char*>(&dim), sizeof(dim))) break;
+
+        MathVector v(static_cast<std::size_t>(dim));
+        f.read(reinterpret_cast<char*>(v.data()),
+               static_cast<std::streamsize>(dim) * sizeof(float));
+        if (!f) break;
+
+        store.insert("vec-" + std::to_string(count), std::move(v));
+        ++count;
+    }
+    return count;
+}
+
+static std::size_t load_fvecs_queries(const std::string&         path,
+                                      std::vector<MathVector>&   queries,
+                                      std::size_t                max_vectors)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return 0;
+
+    std::size_t count = 0;
+    while (count < max_vectors) {
+        int32_t dim = 0;
+        if (!f.read(reinterpret_cast<char*>(&dim), sizeof(dim))) break;
+
+        MathVector v(static_cast<std::size_t>(dim));
+        f.read(reinterpret_cast<char*>(v.data()),
+               static_cast<std::streamsize>(dim) * sizeof(float));
+        if (!f) break;
+
+        queries.push_back(std::move(v));
+        ++count;
+    }
+    return count;
+}
+
 static void run_benchmark() {
     constexpr std::size_t N       = 50'000; // vectors in the dataset
-    constexpr std::size_t D       = 128;    // dimensions per vector
+    constexpr std::size_t D       = 128;    // dimensions per vector (synthetic fallback)
     constexpr std::size_t K       = 10;     // neighbours to retrieve
     constexpr std::size_t Q       = 100;    // timed queries
     constexpr std::size_t M       = 16;     // HNSW max neighbours per layer
@@ -452,23 +511,36 @@ static void run_benchmark() {
     using ms    = std::chrono::duration<double, std::milli>;
     using sec   = std::chrono::duration<double>;
 
-    std::cout << "=== Benchmark: Brute-Force vs HNSW ===\n";
-    std::cout << "  dataset  : " << N << " vectors x " << D << " dimensions\n";
+    std::mt19937 rng(42);
+
+    // -----------------------------------------------------------------------
+    // [1/4] Load (or generate) the dataset
+    // -----------------------------------------------------------------------
+    VectorStore store;
+    std::string dataset_label;
+
+    std::cout << "  [1/4] loading base vectors... " << std::flush;
+    const std::size_t loaded_n = load_fvecs_store("data/sift_base.fvecs", store, N);
+    if (loaded_n > 0) {
+        dataset_label = "SIFT-1M (first " + std::to_string(loaded_n) + ")";
+        std::cout << "loaded " << loaded_n << " SIFT vectors  (128-D)\n";
+    } else {
+        std::cout << "data/sift_base.fvecs not found — generating synthetic data... " << std::flush;
+        for (std::size_t i = 0; i < N; ++i)
+            store.insert("vec-" + std::to_string(i), generate_random_vector(D, rng));
+        dataset_label = "synthetic uniform[-1,1] (" + std::to_string(N) + " x " + std::to_string(D) + ")";
+        std::cout << "done\n";
+    }
+
+    // -----------------------------------------------------------------------
+    // Print benchmark header (dataset source is now known)
+    // -----------------------------------------------------------------------
+    std::cout << "\n=== Benchmark: Brute-Force vs HNSW ===\n";
+    std::cout << "  dataset  : " << dataset_label << "\n";
     std::cout << "  k        : " << K << "\n";
     std::cout << "  queries  : " << Q << "\n";
     std::cout << "  M        : " << M << "  |  ef_construction: " << EF_CON
               << "  |  ef_search: " << EF_SRCH << "\n\n";
-
-    std::mt19937 rng(42);
-
-    // -----------------------------------------------------------------------
-    // Build the shared VectorStore
-    // -----------------------------------------------------------------------
-    std::cout << "  [1/4] building store (" << N << " x " << D << ")... " << std::flush;
-    VectorStore store;
-    for (std::size_t i = 0; i < N; ++i)
-        store.insert("vec-" + std::to_string(i), generate_random_vector(D, rng));
-    std::cout << "done\n";
 
     // -----------------------------------------------------------------------
     // Build HNSW index (timed)
@@ -484,14 +556,20 @@ static void run_benchmark() {
               << build_s << " s,  max_layer=" << hnsw.max_layer() << ")\n";
 
     // -----------------------------------------------------------------------
-    // Pre-generate query vectors outside any timed section
+    // [3/4] Load (or generate) query vectors outside any timed section
     // -----------------------------------------------------------------------
-    std::cout << "  [3/4] generating " << Q << " query vectors... " << std::flush;
+    std::cout << "  [3/4] loading query vectors... " << std::flush;
     std::vector<MathVector> queries;
     queries.reserve(Q);
-    for (std::size_t i = 0; i < Q; ++i)
-        queries.push_back(generate_random_vector(D, rng));
-    std::cout << "done\n\n";
+    const std::size_t loaded_q = load_fvecs_queries("data/sift_query.fvecs", queries, Q);
+    if (loaded_q > 0) {
+        std::cout << "loaded " << loaded_q << " SIFT queries\n\n";
+    } else {
+        const std::size_t qdim = store.dimensionality();
+        for (std::size_t i = 0; i < Q; ++i)
+            queries.push_back(generate_random_vector(qdim, rng));
+        std::cout << "done (synthetic)\n\n";
+    }
 
     // -----------------------------------------------------------------------
     // Time brute-force search and store results for recall computation
