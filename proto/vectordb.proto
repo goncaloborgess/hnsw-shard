@@ -2,8 +2,40 @@ syntax = "proto3";
 
 package vectordb;
 
-// Request to insert or overwrite a vector in the store.
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+// Insert or overwrite a vector in the store.
 message UpsertRequest {
   string id            = 1;  // Caller-assigned stable identifier for this vector.
   repeated float vector = 2;  // The raw float components of the vector.
+}
+
+message UpsertResponse {
+  bool created = 1;  // true = new entry inserted, false = existing entry overwritten.
+}
+
+// Query for the k nearest neighbours of a vector.
+message SearchRequest {
+  repeated float query = 1;  // The query vector (must match store dimensionality).
+  uint32 k             = 2;  // Number of nearest neighbours to return.
+}
+
+message SearchResult {
+  string id       = 1;  // The string identifier of the matched vector.
+  float  distance = 2;  // Euclidean distance from the query vector.
+}
+
+message SearchResponse {
+  repeated SearchResult results = 1;  // Top-k results, sorted ascending by distance.
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service VectorDBService {
+  rpc Upsert(UpsertRequest) returns (UpsertResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
 }

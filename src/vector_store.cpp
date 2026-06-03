@@ -30,6 +30,21 @@ std::size_t VectorStore::insert(const std::string& id, MathVector vec) {
     return index;
 }
 
+bool VectorStore::upsert(const std::string& id, MathVector vec) {
+    auto it = id_to_index_.find(id);
+    if (it != id_to_index_.end()) {
+        if (vec.size() != dimensionality_)
+            throw std::invalid_argument(
+                "VectorStore::upsert: dimension mismatch — expected " +
+                std::to_string(dimensionality_) + ", got " +
+                std::to_string(vec.size()));
+        vectors_[it->second] = std::move(vec);
+        return false;
+    }
+    insert(id, std::move(vec));
+    return true;
+}
+
 const MathVector& VectorStore::get(const std::string& id) const {
     // unordered_map::at throws std::out_of_range on missing key — correct behaviour.
     return vectors_[id_to_index_.at(id)];

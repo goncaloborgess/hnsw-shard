@@ -245,6 +245,29 @@ static void test_vector_store() {
     catch (const std::invalid_argument&) { threw = true; }
     assert(threw);
     std::cout << "  dimension mismatch throws OK\n";
+
+    // --- upsert tests ---
+
+    // upsert new entry: returns true (created)
+    VectorStore ustore;
+    assert(ustore.upsert("u0", MathVector{1.0f, 2.0f, 3.0f}) == true);
+    assert(ustore.size() == 1);
+    assert(near(ustore.get("u0")[0], 1.0f));
+    std::cout << "  upsert new entry         OK\n";
+
+    // upsert existing entry: returns false (overwritten), data updated
+    assert(ustore.upsert("u0", MathVector{9.0f, 8.0f, 7.0f}) == false);
+    assert(ustore.size() == 1);
+    assert(near(ustore.get("u0")[0], 9.0f));
+    assert(near(ustore.get("u0")[2], 7.0f));
+    std::cout << "  upsert overwrite         OK\n";
+
+    // upsert dimension mismatch on overwrite must throw
+    threw = false;
+    try { ustore.upsert("u0", MathVector{1.0f, 2.0f}); }
+    catch (const std::invalid_argument&) { threw = true; }
+    assert(threw);
+    std::cout << "  upsert dim mismatch      OK\n";
 }
 
 static void test_brute_force_search() {

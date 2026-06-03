@@ -18,6 +18,11 @@ public:
     //   - 'vec' dimensionality does not match previously inserted vectors
     std::size_t insert(const std::string& id, MathVector vec);
 
+    // Inserts a new vector, or overwrites an existing one in-place.
+    // Returns true if a new entry was created, false if an existing entry
+    // was overwritten. Throws std::invalid_argument on dimension mismatch.
+    bool upsert(const std::string& id, MathVector vec);
+
     // Retrieve a vector by string ID.
     // Throws std::out_of_range if id is not found.
     const MathVector& get(const std::string& id) const;
