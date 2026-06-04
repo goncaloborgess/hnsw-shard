@@ -1,32 +1,39 @@
 # VectorDB-DS
 
-A distributed vector database built from scratch in modern C++. Demonstrates high-performance systems programming, approximate nearest-neighbour search, and gRPC-based networking.
+A distributed vector database built from scratch in modern C++. Demonstrates high-performance systems programming, approximate nearest-neighbour search, gRPC networking, and distributed scatter-gather query execution.
 
 ## Architecture
 
 ```
-vectordb_client  ──gRPC──►  vectordb_server
-                              ├── VectorStore     (string ID → float vector)
-                              ├── HnswIndex       (O(log N) ANN search)
-                              └── BruteForceIndex (exact k-NN, used for benchmarks)
+                          ┌──gRPC──► Shard 0 (vectordb_server :50051)
+                          │            ├── VectorStore
+vectordb_client ──gRPC──► Coordinator  │   └── HnswIndex
+                          │            │
+                          └──gRPC──► Shard 1 (vectordb_server :50052)
+                                       ├── VectorStore
+                                       └── HnswIndex
 ```
 
-The server owns a `VectorStore` and an `HnswIndex`. Clients insert vectors by ID (`Upsert`) and query nearest neighbours (`Search`). The index is rebuilt automatically on the first search after any upsert.
+**Shards** are stateful gRPC servers, each holding a partitioned subset of vectors in memory with a local HNSW index. **The Coordinator** is a stateless proxy that routes upserts to the correct shard (FNV-1a hash partitioning) and fans out searches to all shards concurrently (`std::async`), then merges the partial top-k results into a global top-k.
+
+The client talks to the coordinator using the same `VectorDBService` proto — it is unaware of the shards behind it.
 
 ## Project Structure
 
 ```
 VectorDB-DS/
 ├── proto/
-│   └── vectordb.proto          # gRPC service definition
+│   └── vectordb.proto          # gRPC service definition (Upsert + Search)
 ├── include/
 │   ├── math_vector.h           # RAII float vector (Rule of Five)
 │   ├── vector_store.h          # ID-addressed vector storage
 │   ├── brute_force_index.h     # Exact k-NN (O(N·D) per query)
-│   └── hnsw_index.h            # HNSW ANN index (O(log N) per query)
+│   ├── hnsw_index.h            # HNSW ANN index (O(log N) per query)
+│   └── partitioner.h           # FNV-1a hash-based shard assignment
 ├── src/
 │   ├── main.cpp                # Unit tests + benchmark driver
-│   ├── server.cpp              # gRPC server wrapping the engine
+│   ├── server.cpp              # Shard: gRPC server wrapping the engine
+│   ├── coordinator.cpp         # Coordinator: scatter-gather proxy
 │   ├── client.cpp              # gRPC client demo
 │   ├── mathVector.cpp
 │   ├── vector_store.cpp
@@ -60,12 +67,13 @@ cmake -S . -B build
 cmake --build build --parallel
 ```
 
-This produces three binaries in `build/`:
+This produces four binaries in `build/`:
 
 | Binary | Description |
 |--------|-------------|
 | `vectordb_tests` | Unit test suite + HNSW/brute-force benchmark |
-| `vectordb_server` | gRPC server (default port 50051) |
+| `vectordb_server` | Shard server — gRPC server with HNSW engine (default port 50051) |
+| `vectordb_coordinator` | Coordinator — scatter-gather proxy over multiple shards |
 | `vectordb_client` | Demo client that upserts vectors and runs searches |
 
 ## Run
@@ -76,11 +84,11 @@ This produces three binaries in `build/`:
 ./build/vectordb_tests
 ```
 
-Runs all unit tests (constructors, Rule of Five, VectorStore, BruteForce, HNSW hierarchy and recall), then a latency benchmark comparing brute-force vs HNSW search.
+Runs all unit tests (constructors, Rule of Five, VectorStore, BruteForce, HNSW hierarchy and recall, partitioner), then a latency benchmark comparing brute-force vs HNSW search.
 
 See [docs/benchmark.md](docs/benchmark.md) for how to run with the SIFT-1M dataset.
 
-### gRPC server + client
+### Single-node mode
 
 In one terminal:
 
@@ -96,10 +104,28 @@ In a second terminal:
 ./build/vectordb_client host:port  # custom address
 ```
 
-Expected client output:
+### Distributed mode (scatter-gather)
+
+Start two shards and the coordinator:
+
+```bash
+# Terminal 1 — Shard 0
+./build/vectordb_server 50051
+
+# Terminal 2 — Shard 1
+./build/vectordb_server 50052
+
+# Terminal 3 — Coordinator
+./build/vectordb_coordinator 50050 localhost:50051 localhost:50052
+
+# Terminal 4 — Client (talks to coordinator)
+./build/vectordb_client localhost:50050
+```
+
+The coordinator hashes each vector ID to determine which shard receives it. On search, it queries all shards in parallel and merges the results:
 
 ```
-Connecting to localhost:50051...
+Connecting to localhost:50050...
 
 [1] Inserting vectors
   Upserted 'a' — created
@@ -124,11 +150,7 @@ Connecting to localhost:50051...
     id="d"  distance=2.68701
 ```
 
-The HNSW index is rebuilt automatically the first time `Search` is called after an `Upsert`. The rebuild log line appears in the server terminal:
-
-```
-Rebuilding HNSW index (5 vectors)... done (max_layer=0)
-```
+The results are identical whether the client talks to a single shard or the distributed coordinator — the scatter-gather merge produces the same global top-k.
 
 ## Development
 

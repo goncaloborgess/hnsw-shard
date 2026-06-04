@@ -2,6 +2,7 @@
 #include "vector_store.h"
 #include "brute_force_index.h"
 #include "hnsw_index.h"
+#include "partitioner.h"
 
 #include <cassert>    // assert()
 #include <chrono>     // high_resolution_clock
@@ -758,6 +759,34 @@ static void test_hnsw_search() {
     std::cout << "  recall >= 0.85            OK\n";
 }
 
+static void test_partitioner() {
+    std::cout << "[partitioner]\n";
+
+    // FNV-1a known values (determinism check)
+    assert(fnv1a_hash("") == 2166136261u);
+    assert(fnv1a_hash("a") == 3826002220u);
+    std::cout << "  fnv1a known values       OK\n";
+
+    // Same input always produces the same shard
+    const std::size_t s1 = assign_shard("vec-42", 3);
+    const std::size_t s2 = assign_shard("vec-42", 3);
+    assert(s1 == s2);
+    std::cout << "  deterministic routing    OK\n";
+
+    // Single shard: everything maps to 0
+    for (int i = 0; i < 20; ++i)
+        assert(assign_shard("id-" + std::to_string(i), 1) == 0);
+    std::cout << "  single shard all -> 0    OK\n";
+
+    // Distribution: 100 IDs across 3 shards — each shard gets at least 1
+    std::size_t counts[3] = {};
+    for (int i = 0; i < 100; ++i)
+        counts[assign_shard("vec-" + std::to_string(i), 3)]++;
+    assert(counts[0] > 0 && counts[1] > 0 && counts[2] > 0);
+    std::cout << "  distribution across 3    OK  ("
+              << counts[0] << "/" << counts[1] << "/" << counts[2] << ")\n";
+}
+
 // =============================================================================
 // Entry point
 // =============================================================================
@@ -784,6 +813,8 @@ int main() {
     test_hnsw_hierarchy();
     std::cout << '\n';
     test_hnsw_search();
+    std::cout << '\n';
+    test_partitioner();
 
     std::cout << "\nAll tests passed.\n\n";
 

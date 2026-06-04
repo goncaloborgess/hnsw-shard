@@ -72,3 +72,8 @@ target_link_libraries(vectordb_server PRIVATE vectordb_core vectordb_proto)
 # gRPC client
 add_executable(vectordb_client src/client.cpp)
 target_link_libraries(vectordb_client PRIVATE vectordb_proto)
+
+# Coordinator (scatter-gather proxy)
+add_executable(vectordb_coordinator src/coordinator.cpp)
+target_include_directories(vectordb_coordinator PRIVATE include)
+target_link_libraries(vectordb_coordinator PRIVATE vectordb_proto Threads::Threads)
