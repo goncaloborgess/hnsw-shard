@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vectordb-coordinator
+  namespace: vectordb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vectordb-coordinator
+  template:
+    metadata:
+      labels:
+        app: vectordb-coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: vectordb-coordinator:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "50050"
+            - "vectordb-shard-0.vectordb-shard-headless.vectordb.svc.cluster.local:50051"
+            - "vectordb-shard-1.vectordb-shard-headless.vectordb.svc.cluster.local:50051"
+          ports:
+            - containerPort: 50050
+              name: grpc

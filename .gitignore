@@ -6,5 +6,9 @@ build/
 *.a
 *.out
 
+# Benchmark data and third-party dataset tooling (hundreds of MB)
+data/
+download-test/
+
 .DS_Store
 settings.json

@@ -1,0 +1,9 @@
+build/
+download-test/
+.git/
+.DS_Store
+.vscode/
+.claude/
+*.o
+*.a
+*.out

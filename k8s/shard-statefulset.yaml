@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vectordb-shard
+  namespace: vectordb
+spec:
+  serviceName: vectordb-shard-headless
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vectordb-shard
+  template:
+    metadata:
+      labels:
+        app: vectordb-shard
+    spec:
+      containers:
+        - name: shard
+          image: vectordb-shard:latest
+          imagePullPolicy: IfNotPresent
+          args: ["50051"]
+          ports:
+            - containerPort: 50051
+              name: grpc

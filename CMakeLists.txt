@@ -50,7 +50,7 @@ target_link_libraries(vectordb_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
 # ---------------------------------------------------------------------------
 
 add_library(vectordb_core STATIC
-    src/mathVector.cpp
+    src/math_vector.cpp
     src/vector_store.cpp
     src/brute_force_index.cpp
     src/hnsw_index.cpp
@@ -61,9 +61,17 @@ target_include_directories(vectordb_core PUBLIC include)
 # Executables
 # ---------------------------------------------------------------------------
 
-# Tests and benchmark (the original binary)
-add_executable(vectordb_tests src/main.cpp)
+# Unit test suite
+# The assertions ARE the tests, so NDEBUG must never reach this target —
+# a Release build would otherwise compile every assert() away and the suite
+# would report success without checking anything.
+add_executable(vectordb_tests tests/test_main.cpp)
+target_compile_options(vectordb_tests PRIVATE -UNDEBUG)
 target_link_libraries(vectordb_tests PRIVATE vectordb_core)
+
+# Brute-force vs HNSW benchmark
+add_executable(vectordb_bench bench/bench_main.cpp)
+target_link_libraries(vectordb_bench PRIVATE vectordb_core)
 
 # gRPC server
 add_executable(vectordb_server src/server.cpp)

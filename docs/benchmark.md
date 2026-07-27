@@ -13,7 +13,7 @@ The benchmark uses the **SIFT-1M** dataset distributed by
 | Property | Value |
 |----------|-------|
 | Full dataset size | 1,000,000 vectors |
-| Vectors used here | first 50,000 (controlled by `N` in `src/main.cpp`) |
+| Vectors used here | first 50,000 (controlled by `N` in `bench/bench_main.cpp`) |
 | Dimensionality | 128 floats per vector |
 | Vector type | SIFT image descriptors (Scale-Invariant Feature Transform) |
 | Query set | first 100 vectors from the 10,000-query file |
@@ -79,16 +79,17 @@ For SIFT-128 every record is 4 + 128 × 4 = **516 bytes**.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-./build/VectorDB-DS
+./build/vectordb_bench
 ```
 
-The binary runs the unit-test suite first, then the benchmark.
+`-DCMAKE_BUILD_TYPE=Release` is required — without `-O3` the latency numbers below
+are not comparable. The unit test suite is a separate binary, `./build/vectordb_tests`.
 
 ---
 
 ## HNSW parameters
 
-These constants are defined at the top of `run_benchmark()` in `src/main.cpp`.
+These constants are defined at the top of `run_benchmark()` in `bench/bench_main.cpp`.
 
 | Parameter | Symbol | Default | Effect |
 |-----------|--------|---------|--------|
@@ -197,8 +198,9 @@ Most production ANN systems target recall ≥ 0.95.
 ### Build time
 
 The **19.27 s** build time is paid once when the index is constructed from scratch.
-In a real deployment the index is serialised to disk after building and loaded
-on subsequent starts (see Chapter 3 of this project).
+In a real deployment the index would be serialised to disk after building and
+loaded on subsequent starts; this project does not implement persistence — the
+index is rebuilt in memory on every start.
 
 ---
 
@@ -213,7 +215,7 @@ Adjust `EF_SRCH` (search beam width) to trade recall for latency without rebuild
 | 100 | ~0.99 | ~2× |
 | 200 | ~1.00 | ~4× |
 
-To change it, modify `EF_SRCH` in `src/main.cpp` and rebuild.
+To change it, modify `EF_SRCH` in `bench/bench_main.cpp` and rebuild.
 
 Increase `M` or `EF_CON` to improve graph quality (raises recall ceiling and
 reduces the recall drop at low `ef_search`), at the cost of a longer build time
