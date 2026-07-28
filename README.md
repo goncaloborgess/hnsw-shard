@@ -1,4 +1,4 @@
-# VectorDB-DS
+# hnsw-shard
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)
 ![CMake](https://img.shields.io/badge/build-CMake%20%E2%89%A5%203.15-064F8C?logo=cmake&logoColor=white)
@@ -88,7 +88,7 @@ size are rejected with `INVALID_ARGUMENT`.
 ## Project structure
 
 ```
-VectorDB-DS/
+hnsw-shard/
 ├── proto/
 │   └── vectordb.proto          # gRPC service definition (Upsert + Search)
 ├── include/
