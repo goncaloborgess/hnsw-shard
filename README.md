@@ -334,4 +334,4 @@ production database:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[LICENSE](LICENSE).
